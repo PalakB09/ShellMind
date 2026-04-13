@@ -29,11 +29,21 @@ Verify the installation by running:
 ai --version
 ```
 
+## ⚡ The Waterfall Engine (Priority Execution)
+
+Unlike traditional AI wrappers, this tool is built for speed. When you enter a command, the engine follows a strict **Waterfall Discovery** path to minimize latency and API costs:
+
+1.  **Local Workflows (`ai-commands.md`)**: Instant detection of repository-specific macros.
+2.  **Global Workflows (`~/.ai-cli/commands.json`)**: Universal macros saved across your machine.
+3.  **Intent Memory (0-Latency Cache)**: If you've run a specific natural language instruction before via AI, we cache the result globally. Second-time executions are **instant** and offline.
+4.  **Built-In Defaults**: Hardcoded `setup`, `dev`, `test`, `deploy`, and `reset` commands optimized for Node, Docker, and Python environments.
+5.  **Autonomous AI**: Intelligent generation via Gemini/OpenRouter only if all local memory layers fail.
+
 ---
 
 ## 🟢 MODE 1: The AI Co-Pilot (API Enabled)
 
-If you configure an API Key, the tool transforms into an intelligent shell agent. It parses your natural language, writes OS-specific shell commands, executes them through a safety layer, and automatically self-heals terminal errors.
+If all memory layers fail, the tool transforms into an intelligent shell agent. It parses your natural language, writes OS-specific shell commands, and automatically self-heals terminal errors.
 
 ### 🔑 Configuration Setup
 Create a globally accessible configuration file at `~/.ai-cli/config.json`:
@@ -41,16 +51,14 @@ Create a globally accessible configuration file at `~/.ai-cli/config.json`:
 ```json
 {
   "provider": "gemini",
-  "apiKeys": { 
-    "gemini": "YOUR_GEMINI_KEY",
-    "openrouter": "OPTIONAL_FALLBACK_KEY"
-  },
+  "apiKeys": { "gemini": "YOUR_KEY" },
   "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
 }
 ```
 *(You can also simply drop a `.env` file containing `GEMINI_API_KEY` into your current working directory).*
 
 **Smart Network Routing:** Our built-in intelligence dynamically cascades between your specified models. If `gemini-2.5-pro` hits an HTTP 429 Rate Limit, we instantly funnel the execution down to `gemini-2.5-flash` so you physically never experience a crash!
+
 
 ### ✨ Feature 1: Single Shot Execution (`ai <instruction>`)
 Fire and forget. The CLI determines the right commands for your specific Operating System (Mac, Windows, Linux) and asks to run them.

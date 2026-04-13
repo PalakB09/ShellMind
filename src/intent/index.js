@@ -216,8 +216,8 @@ export async function parseIntent(instruction, conversationHistory = []) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const spinner = ora({
       text: attempt === 0
-        ? chalk.cyan('Thinking...')
-        : chalk.cyan(`Retrying (${attempt}/${MAX_RETRIES})...`),
+        ? chalk.cyan('⚡ Planning...')
+        : chalk.cyan(`⚡ Replanning (${attempt}/${MAX_RETRIES})...`),
       spinner: 'dots',
     }).start();
 
@@ -239,12 +239,12 @@ export async function parseIntent(instruction, conversationHistory = []) {
         content: instruction,
       });
 
-      // Call through the router — tries OpenRouter free models first, then Gemini
+      // Call through the router — executing natively and silently fetching AI fallbacks
       const result = await callAI(systemPrompt, messages, {
         temperature: 0.1,
         maxTokens: 2048,
         jsonMode: true,
-        silent: false,  // Show routing decisions
+        silent: true,  // Strictly block routing logs to keep UX polished
       });
 
       spinner.stop();

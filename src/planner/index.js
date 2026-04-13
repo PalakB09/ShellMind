@@ -2,12 +2,62 @@
 // HARDENED: max retry depth cap, validated AI fixes before execution, improved UX.
 import chalk from 'chalk';
 import readline from 'readline';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { parseIntent, explainError } from '../intent/index.js';
-import { analyzePlan, displayPlan, promptConfirmation } from '../safety/index.js';
+import { analyzeIntent, analyzePlan, displayPlan, promptConfirmation } from '../safety/index.js';
 import { executePlan } from '../executor/index.js';
-import { saveCommand } from '../memory/index.js';
+import { saveCommand, loadCommand, commandExists } from '../memory/index.js';
+import { checkIntentMemory, cacheSuccessfulIntent } from '../memory/intent.js';
+import { getBuiltInWorkflow } from '../memory/defaults.js';
 
 const MAX_PIPELINE_DEPTH = 3;  // Prevent infinite retry/clarification loops
+const LAST_PLAN_FILE = path.join(os.homedir(), '.ai-cli', 'last-plan.json');
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+export async function saveLastPlan(name, options = {}) {
+  if (!name) {
+    console.log(chalk.yellow('\nUsage: ai save <name> [--global|--repo]\n'));
+    return;
+  }
+
+  const plan = loadLastPlan();
+  if (!plan || !plan.steps || plan.steps.length === 0) {
+    console.log(chalk.yellow('\nNo previous plan to save. Run a command first, then use "ai save <name>".\n'));
+    return;
+  }
+
+  let targetScope = options.scope;
+  if (name === 'deploy-plan') console.error('DEBUG PLANNER SCOPE:', JSON.stringify(targetScope));
+  if (targetScope === null) {
+    console.trace('TRACE: targetScope is null');
+    const choice = await askInput('Save to: (g)lobal / (r)epo? (default: global)');
+    targetScope = choice.toLowerCase().startsWith('r') ? 'local' : 'global';
+  } else if (!targetScope) {
+    targetScope = 'global';
+  }
+
+  if (commandExists(name, targetScope)) {
+    const scopeLabel = targetScope === 'local' ? 'repo' : 'global';
+    const answer = await promptConfirmation(chalk.yellow(`\n"${name}" already exists in ${scopeLabel} workflows. Overwrite?`));
+    if (answer !== 'yes') {
+      console.log(chalk.yellow('\nCancelled.\n'));
+      return;
+    }
+  }
+
+  saveCommand(name, {
+    commands: plan.steps.map(s => s.command),
+    description: plan.intent,
+    steps: plan.steps,
+  }, targetScope);
+
+  console.log(chalk.green(`\nSaved "${name}" to ${targetScope === 'local' ? 'repo' : 'global'} workflows.\n`));
+}
 
 /**
  * Prompt the user for input (e.g., commit message).
@@ -25,6 +75,39 @@ function askInput(prompt) {
       resolve(answer.trim());
     });
   });
+}
+
+function normalizeStoredPlan(plan) {
+  const steps = plan?.steps || (plan?.commands || []).map(c => ({ command: c, description: c }));
+  if (!plan || !steps || steps.length === 0) return null;
+  return {
+    intent: plan.intent || plan.description || plan.name || 'Saved workflow',
+    steps: steps.map(s => ({
+      command: s.command,
+      description: s.description || s.command,
+      requiresInput: s.requiresInput === true,
+    })),
+    savedAt: new Date().toISOString(),
+    cwd: process.cwd(),
+  };
+}
+
+export function persistLastPlan(plan) {
+  const stored = normalizeStoredPlan(plan);
+  if (!stored) return;
+  ensureDir(path.dirname(LAST_PLAN_FILE));
+  const tempPath = LAST_PLAN_FILE + '.tmp';
+  fs.writeFileSync(tempPath, JSON.stringify(stored, null, 2), 'utf-8');
+  fs.renameSync(tempPath, LAST_PLAN_FILE);
+}
+
+export function loadLastPlan() {
+  if (!fs.existsSync(LAST_PLAN_FILE)) return null;
+  try {
+    return normalizeStoredPlan(JSON.parse(fs.readFileSync(LAST_PLAN_FILE, 'utf-8')));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -78,11 +161,7 @@ export async function runPipeline(instruction, options = {}) {
 
   // Guard: Graceful degradation (No-Key Mode)
   const { hasAnyApiKey } = await import('../config/index.js');
-  if (!hasAnyApiKey()) {
-    console.log(chalk.yellow('\n⚠ AI features disabled. Using basic mode. Add an API key (`GEMINI_API_KEY` or `OPENROUTER_API_KEY`) for full capabilities.\n'));
-    console.log(chalk.dim('You can still use basic commands like: "ai save <name>", "ai run <name>", and "ai list".'));
-    return { success: false, results: null, plan: null };
-  }
+  const usesAI = hasAnyApiKey();
 
   // Guard: prevent infinite loops
   if (_depth >= MAX_PIPELINE_DEPTH) {
@@ -90,42 +169,89 @@ export async function runPipeline(instruction, options = {}) {
     return { success: false, results: null, plan: null };
   }
 
-  // Step 1: Parse intent
-  const intent = await parseIntent(instruction, history);
-  if (!intent) {
-    return { success: false, results: null, plan: null };
+  let intent = null;
+  let isFromAI = false;
+
+  // ─── 1. Waterfall Memory Check ────────────────────────ــــ─
+
+  // Attempt to load natively without AI by exactly matching instruction string
+  const normalizedInst = instruction.trim();
+
+  // A. Local Workflow (ai-commands.md)
+  let nativeObj = loadCommand(normalizedInst);
+  if (nativeObj) {
+    intent = { name: normalizedInst, ...nativeObj };
   }
 
-  // Step 2: If AI needs more info, ask and re-run
-  if (intent.needsMoreInfo) {
-    console.log(chalk.yellow(`\n❓ ${intent.question}\n`));
-    const answer = await askInput('Your answer');
+  // B. Global Workflow (~/.ai-cli/commands.json)
+  // loadCommand inherently checks Local then Global, so A covers B.
 
-    if (!answer) {
-      console.log(chalk.yellow('\n✋ No input provided. Cancelling.\n'));
+  // C. Intent Cache (Previous successful AI executions)
+  if (!intent) {
+    const cachedIntent = checkIntentMemory(normalizedInst);
+    if (cachedIntent) intent = cachedIntent;
+  }
+
+  // D. Built-In Default Workflows
+  if (!intent) {
+    const builtinIntent = getBuiltInWorkflow(normalizedInst);
+    if (builtinIntent) intent = builtinIntent;
+  }
+
+  // ─── 2. AI Fallback Generation ─────────────────────────────
+
+  if (!intent) {
+    const intentSafety = analyzeIntent(normalizedInst);
+    if (intentSafety.classification === 'dangerous') {
+      console.log(chalk.red('\nBlocked before planning. This request appears destructive or unsafe.'));
+      for (const risk of intentSafety.risks) {
+        console.log(chalk.red(`  - ${risk.reason}`));
+      }
+      console.log();
+      return { success: false, results: null, plan: null };
+    }
+  }
+
+  if (!intent) {
+    if (!usesAI) {
+      console.log(chalk.yellow('\n⚠ No matching workflow found. AI generation is disabled because no API key is configured.\n'));
       return { success: false, results: null, plan: null };
     }
 
-    return runPipeline(`${instruction}\n\nUser clarification: ${answer}`, {
-      ...options,
-      _depth: _depth + 1,
-    });
+    isFromAI = true;
+    intent = await parseIntent(instruction, history);
+    
+    if (!intent) {
+      return { success: false, results: null, plan: null };
+    }
+
+    // Interactive clarifications needed?
+    if (intent.needsMoreInfo) {
+      console.log(chalk.yellow(`\n❓ ${intent.question}\n`));
+      const answer = await askInput('Your answer');
+
+      if (!answer) {
+        console.log(chalk.yellow('\n✋ No input provided. Cancelling.\n'));
+        return { success: false, results: null, plan: null };
+      }
+
+      return runPipeline(`${instruction}\n\nUser clarification: ${answer}`, {
+        ...options,
+        _depth: _depth + 1,
+      });
+    }
   }
 
-  // Display parsed intent
-  console.log(chalk.bold.magenta(`\n🎯 Intent: `) + chalk.white(intent.intent));
+  const hasSteps = intent.steps && intent.steps.length > 0;
+  const hasCommands = intent.commands && intent.commands.length > 0;
 
-  if (intent.notes) {
-    console.log(chalk.dim(`   ℹ ${intent.notes}`));
-  }
-
-  if (intent.steps.length === 0) {
+  if (!hasSteps && !hasCommands) {
     console.log(chalk.yellow('\nNo commands to execute.'));
     return { success: true, results: null, plan: intent };
   }
 
   // Step 3: Resolve user inputs (placeholders)
-  const resolvedSteps = await resolveInputs(intent.steps);
+  const resolvedSteps = await resolveInputs(intent.steps || intent.commands.map(c => ({ command: c, description: c })));
 
   if (resolvedSteps.length === 0) {
     console.log(chalk.yellow('\nAll steps were skipped. Nothing to execute.'));
@@ -134,6 +260,10 @@ export async function runPipeline(instruction, options = {}) {
 
   // Step 4: Safety analysis
   const safetyResult = analyzePlan(resolvedSteps);
+  persistLastPlan({
+    intent: intent.intent || intent.description || intent.name || instruction,
+    steps: resolvedSteps,
+  });
 
   // Step 5: Display plan
   displayPlan(resolvedSteps, safetyResult);
@@ -209,7 +339,12 @@ Please suggest a corrected approach.`;
       }
     }
   } else {
-    console.log(chalk.green.bold('\n✅ All steps completed successfully!\n'));
+    console.log(chalk.green.bold('\n✅ Done!\n'));
+
+    if (isFromAI) {
+      cacheSuccessfulIntent(instruction, resolvedSteps);
+      console.log(chalk.dim(`💡 Run this often? Save it as a workflow: ai save <name>\n`));
+    }
   }
 
   return {
@@ -225,7 +360,7 @@ Please suggest a corrected approach.`;
  * @param {object} plan - The plan object from runPipeline
  * @param {'local'|'global'} scope
  */
-export function saveLastPlan(name, plan, scope = 'local') {
+function legacySaveLastPlanForCompatibility(name, plan, scope = 'local') {
   if (!plan || !plan.steps || plan.steps.length === 0) {
     console.log(chalk.yellow('No plan to save.'));
     return;

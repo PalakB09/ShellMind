@@ -119,7 +119,7 @@ export async function startChat(options = {}) {
       }
 
       try {
-        saveLastPlan(name, lastResult.plan, 'local');
+        await saveLastPlan(name, { scope: 'local' });
       } catch (err) {
         console.log(chalk.red(`\n✗ Could not save: ${err.message}\n`));
       }
@@ -174,8 +174,9 @@ export async function startChat(options = {}) {
 
       // Add AI response summary to history for context
       if (result.plan) {
-        const stepSummary = result.plan.steps.length > 0
-          ? result.plan.steps.map(s => s.command).join('; ')
+        const steps = result.plan.steps || (result.plan.commands || []).map(c => ({ command: c }));
+        const stepSummary = steps.length > 0
+          ? steps.map(s => s.command).join('; ')
           : '(no commands)';
         const status = result.success
           ? 'Executed successfully.'

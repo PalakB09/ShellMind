@@ -62,7 +62,7 @@ function writeJSON(filePath, data) {
 
 function readMarkdown(filePath) {
   if (!fs.existsSync(filePath)) return {};
-  const content = fs.readFileSync(filePath, 'utf-8');
+  const content = fs.readFileSync(filePath, 'utf-8').replace(/^\uFEFF/, '');
   const commands = {};
 
   // Split by top-level headers. We ensure a newline precedes `##` to prevent mid-paragraph mismatches
@@ -75,17 +75,24 @@ function readMarkdown(filePath) {
 
     let description = '';
     let commandBlock = false;
+    let blockCount = 0;
     let cmdLines = [];
+    let isMalformed = false;
 
     for (let j = 1; j < lines.length; j++) {
       const line = lines[j];
-      
+
       // Match markdown codeblocks (ignoring the language specifier)
       if (line.trim().startsWith('```')) {
         if (!commandBlock) {
           commandBlock = true;
+          blockCount++;
+          if (blockCount > 1) {
+            isMalformed = true;
+            break;
+          }
         } else {
-          break; // Closing fence found
+          commandBlock = false; // Closing fence found
         }
       } else if (commandBlock) {
         cmdLines.push(line);
@@ -94,6 +101,10 @@ function readMarkdown(filePath) {
         description = line.trim();
       }
     }
+
+    if (commandBlock) isMalformed = true; // Unclosed block
+
+    if (isMalformed) continue;
 
     const commandsArray = cmdLines.map(l => l.trim()).filter(Boolean);
 
@@ -138,7 +149,7 @@ function writeMarkdownSafely(filePath, name, entry) {
 function deleteMarkdownSafely(filePath, name) {
   if (!fs.existsSync(filePath)) return false;
   let content = fs.readFileSync(filePath, 'utf-8');
-  
+
   const sectionRegex = new RegExp(`^##\\s+${name}\\s*\\n[\\s\\S]*?(?=(^##\\s+)|$)`, 'm');
   if (sectionRegex.test(content)) {
     content = content.replace(sectionRegex, '');
@@ -185,6 +196,18 @@ export function listCommands() {
     local: readMarkdown(getLocalFilePath()),
     global: readJSON(GLOBAL_FILE),
   };
+}
+
+export function commandExists(name, scope = 'local') {
+  if (!name || typeof name !== 'string') return false;
+
+  if (scope === 'global') {
+    const data = readJSON(GLOBAL_FILE);
+    return !!data[name];
+  } else {
+    const data = readMarkdown(getLocalFilePath());
+    return !!data[name];
+  }
 }
 
 export function deleteCommand(name, scope = 'local') {

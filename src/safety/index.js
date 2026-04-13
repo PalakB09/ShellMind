@@ -1,210 +1,228 @@
-// Safety Engine — three-tier command classification, expanded pattern list, tiered confirmation.
-// HARDENED: safe/caution/dangerous tiers, expanded patterns, command length limit, injection detection.
+// Safety Module — intent-based, two-tier system.
+//
+// Design principle: nothing is ever silently blocked.
+// The user is always shown the command and always has the final say.
+//
+// Classification tiers:
+//   dangerous — requires typing the full word "yes"
+//   caution   — prompts y / n / edit
+//   safe      — runs immediately
+//
+// What we do NOT do:
+//   ✗ Hard-block anything (user types YES → it runs, period)
+//   ✗ Check $() or backtick syntax blindly
+//   ✗ Depend on bash/zsh/PowerShell-specific rules
+//   ✗ Block normal developer commands
+
 import chalk from 'chalk';
 import readline from 'readline';
 
-// ─── Tier Classification ──────────────────────────────────
-// Each pattern has a tier: 'caution' (needs y/n) or 'dangerous' (needs "yes" typed out)
-
-const SAFETY_PATTERNS = [
-  // ─── DANGEROUS (Tier 3): Irreversible, system-level, or data-destroying ───
-  { pattern: /rm\s+(-[a-z]*f[a-z]*\s+|.*--force).*\//i, reason: 'Forced recursive file deletion', tier: 'dangerous' },
-  { pattern: /rm\s+-[a-z]*r[a-z]*/i, reason: 'Recursive file deletion', tier: 'dangerous' },
-  { pattern: /rm\s+~|rm\s+\/|rm\s+\$HOME/i, reason: 'Deleting home or root directory', tier: 'dangerous' },
-  { pattern: /rmdir\s+\/s/i, reason: 'Recursive directory deletion (Windows)', tier: 'dangerous' },
-  { pattern: /Remove-Item.*-Recurse/i, reason: 'Recursive deletion (PowerShell)', tier: 'dangerous' },
-  { pattern: /Remove-Item\s+.*-Force/i, reason: 'Forced deletion (PowerShell)', tier: 'dangerous' },
-  { pattern: /del\s+\/[sfq]/i, reason: 'Forced file deletion (Windows)', tier: 'dangerous' },
-  { pattern: /format\s+[a-z]:/i, reason: 'Disk formatting', tier: 'dangerous' },
-  { pattern: /mkfs\./i, reason: 'Filesystem formatting', tier: 'dangerous' },
-  { pattern: /dd\s+if=/i, reason: 'Low-level disk write (dd)', tier: 'dangerous' },
-  { pattern: /:\(\)\{\s*:\|:\s*&\s*\};:/i, reason: 'Fork bomb detected', tier: 'dangerous' },
-  { pattern: />\s*\/dev\/sd[a-z]/i, reason: 'Writing directly to disk device', tier: 'dangerous' },
-  { pattern: /git\s+reset\s+--hard/i, reason: 'Hard git reset — destroys uncommitted changes', tier: 'dangerous' },
-  { pattern: /git\s+push\s+.*--force/i, reason: 'Force push — may overwrite remote history', tier: 'dangerous' },
-  { pattern: /git\s+push\s+-f\b/i, reason: 'Force push (shorthand)', tier: 'dangerous' },
-  { pattern: /git\s+rebase\s+.*--force/i, reason: 'Forced rebase — may rewrite history', tier: 'dangerous' },
-  { pattern: /DROP\s+TABLE|DROP\s+DATABASE|TRUNCATE/i, reason: 'Destructive SQL operation', tier: 'dangerous' },
-  { pattern: /curl.*\|\s*(bash|sh|zsh|powershell)/i, reason: 'Piping remote script to shell', tier: 'dangerous' },
-  { pattern: /wget.*\|\s*(bash|sh|zsh)/i, reason: 'Piping remote script to shell', tier: 'dangerous' },
-  { pattern: /Invoke-Expression.*\(.*Invoke-WebRequest/i, reason: 'Downloading and executing remote code (PowerShell)', tier: 'dangerous' },
-  { pattern: /iex\s*\(.*iwr/i, reason: 'Downloading and executing remote code (PowerShell shorthand)', tier: 'dangerous' },
-  { pattern: /shutdown|reboot|poweroff/i, reason: 'System shutdown/reboot', tier: 'dangerous' },
-  { pattern: /Stop-Computer|Restart-Computer/i, reason: 'System shutdown/reboot (PowerShell)', tier: 'dangerous' },
-  { pattern: /reg\s+delete/i, reason: 'Windows registry deletion', tier: 'dangerous' },
-  { pattern: /Clear-EventLog/i, reason: 'Clearing Windows event logs', tier: 'dangerous' },
-
-  // ─── CAUTION (Tier 2): Potentially risky but sometimes needed ───
-  { pattern: /sudo\s+/i, reason: 'Elevated privilege command', tier: 'caution' },
-  { pattern: /runas\s+/i, reason: 'Elevated privilege command (Windows)', tier: 'caution' },
-  { pattern: /git\s+clean\s+-[a-z]*f/i, reason: 'Force clean untracked files', tier: 'caution' },
-  { pattern: /git\s+stash\s+drop/i, reason: 'Dropping git stash', tier: 'caution' },
-  { pattern: /git\s+branch\s+-[dD]/i, reason: 'Deleting a git branch', tier: 'caution' },
-  { pattern: /chmod\s+777/i, reason: 'Setting world-writable permissions', tier: 'caution' },
-  { pattern: /chmod\s+-R/i, reason: 'Recursive permission change', tier: 'caution' },
-  { pattern: /chown\s+-R/i, reason: 'Recursive ownership change', tier: 'caution' },
-  { pattern: /kill\s+-9/i, reason: 'Force killing a process', tier: 'caution' },
-  { pattern: /kill\s+-SIGKILL/i, reason: 'SIGKILL a process', tier: 'caution' },
-  { pattern: /taskkill\s+\/f/i, reason: 'Force killing a process (Windows)', tier: 'caution' },
-  { pattern: /Stop-Process\s+-Force/i, reason: 'Force killing a process (PowerShell)', tier: 'caution' },
-  { pattern: /npm\s+publish/i, reason: 'Publishing to npm registry', tier: 'caution' },
-  { pattern: /pip\s+install\s+(?!-r).*--break-system/i, reason: 'Breaking system Python packages', tier: 'caution' },
-  { pattern: /pip\s+install\s+--user.*--force/i, reason: 'Force installing pip packages', tier: 'caution' },
-  { pattern: /env\s+.*=.*>/i, reason: 'Potential environment variable leak to file', tier: 'caution' },
-  { pattern: /mv\s+\//i, reason: 'Moving files from root directory', tier: 'caution' },
-  { pattern: /Move-Item.*\\\\/i, reason: 'Moving files (PowerShell)', tier: 'caution' },
-  { pattern: /npm\s+uninstall\s+-g/i, reason: 'Globally uninstalling npm packages', tier: 'caution' },
-  { pattern: /pip\s+uninstall/i, reason: 'Uninstalling Python packages', tier: 'caution' },
-  { pattern: /docker\s+rm\s+-f/i, reason: 'Force removing Docker containers', tier: 'caution' },
-  { pattern: /docker\s+system\s+prune/i, reason: 'Pruning Docker system', tier: 'caution' },
-  { pattern: /Set-ExecutionPolicy/i, reason: 'Changing PowerShell execution policy', tier: 'caution' },
-  { pattern: /netsh\s+/i, reason: 'Network configuration change', tier: 'caution' },
-];
-
-// ─── Injection Detection ──────────────────────────────────
-
-const INJECTION_PATTERNS = [
-  /;\s*(rm|del|format|shutdown|reboot)/i,
-  /&&\s*(rm|del|format|shutdown|reboot)/i,
-  /\|\|\s*(rm|del|format|shutdown|reboot)/i,
-  /`[^`]*(rm|del|format|shutdown|reboot)[^`]*`/i,
-  /\$\([^)]*(?:rm|del|format|shutdown|reboot)[^)]*\)/i,
-];
-
 const MAX_COMMAND_LENGTH = 2000;
 
-// ─── Analysis Functions ───────────────────────────────────
+// ─── Intent Patterns ──────────────────────────────────────────────────────────
+// Checked against raw user input BEFORE the AI generates commands.
+// Only flags obviously catastrophic natural-language intent.
+
+const INTENT_PATTERNS = [
+  {
+    pattern: /\b(delete|remove|wipe|erase)\s+(everything|all|the\s+project|this\s+repo|my\s+files|all\s+files)\b/i,
+    reason: 'Broad destructive deletion request',
+  },
+  {
+    pattern: /\bformat\s+(disk|drive|computer|machine|system)\b/i,
+    reason: 'Disk formatting request',
+  },
+  {
+    pattern: /\bdocker\s+(kill|stop|remove|rm)\s+(all|everything)\b/i,
+    reason: 'Mass Docker container destruction',
+  },
+];
+
+// ─── Dangerous Command Patterns ───────────────────────────────────────────────
+// Matched against the full command string.
+// Requires the user to explicitly type "yes" before running.
+// Pattern matching works on the full string so it catches operations embedded
+// in chains (e.g. "echo ok && rm -rf /") or subshells (e.g. "echo $(rm -rf /)").
+
+const DANGEROUS_PATTERNS = [
+  // rm on root / home / wildcard.
+  // The end-of-token check ([^\w\/]|$) ensures "rm -rf /home" is NOT matched —
+  // only "rm -rf /" (root) is. Local paths like "./dir" fall through to CAUTION.
+  { pattern: /\brm\s+-[a-z]*r[a-z]*\s+\/([^\w\/]|$)/i,  reason: 'Recursive deletion from filesystem root' },
+  { pattern: /\brm\s+-[a-z]*r[a-z]*\s+~([^\w]|$)/i,     reason: 'Recursive deletion of home directory' },
+  { pattern: /\brm\s+-[a-z]*r[a-z]*\s+\*/i,             reason: 'Recursive deletion of all files (wildcard)' },
+  { pattern: /\brmdir\s+\/s\b/i,                          reason: 'Recursive directory removal' },
+
+  // Disk / filesystem destruction
+  { pattern: /\bformat\s+([a-zA-Z]:|disk|drive)\b/i,     reason: 'Disk formatting' },
+  { pattern: /\bmkfs\b/i,                                 reason: 'Filesystem creation / formatting' },
+  { pattern: /\bdd\s+if=.*\bof=\/dev\//i,                reason: 'Low-level disk write' },
+  { pattern: /:\(\)\{\s*:\|:\s*&\s*\};:/i,               reason: 'Fork bomb pattern' },
+
+  // Remote code execution
+  { pattern: /\b(curl|wget)\b.*\|\s*(bash|sh|zsh|fish|powershell|pwsh)\b/i, reason: 'Piping remote script directly to shell' },
+  { pattern: /\b(Invoke-Expression|iex)\b/i,              reason: 'Executing arbitrary code via iex / Invoke-Expression' },
+  { pattern: /\bpowershell\b.*(-EncodedCommand|-enc)\b/i, reason: 'Encoded PowerShell execution' },
+
+  // Database / registry / system
+  { pattern: /\bDROP\s+(TABLE|DATABASE)\b|\bTRUNCATE\b/i, reason: 'Destructive SQL operation' },
+  { pattern: /\breg\s+delete\b/i,                          reason: 'Windows registry key deletion' },
+  { pattern: /\b(shutdown|reboot|poweroff|Stop-Computer|Restart-Computer)\b/i, reason: 'System shutdown or restart' },
+
+  // Git: only force push is dangerous — plain push is caution
+  { pattern: /\bgit\s+push\b.*(--force|-f)\b/i,            reason: 'Force push rewrites remote history' },
+
+  // Filesystem root permissions
+  { pattern: /\bchmod\s+777\s+(\/|~|\$HOME)(\s|$)/i,       reason: 'World-writable permissions on root or home directory' },
+];
+
+// ─── Caution Command Patterns ─────────────────────────────────────────────────
+// Matched against the full command string.
+// Shows the command and asks y / n / edit.
+
+const CAUTION_PATTERNS = [
+  { pattern: /\bgit\s+push\b(?!.*(--force|-f)\b)/i,  reason: 'Pushing to remote' },
+  { pattern: /\bgit\s+reset\s+--hard\b/i,            reason: 'Hard reset discards uncommitted changes' },
+  { pattern: /\bgit\s+clean\s+-[a-z]*f/i,            reason: 'Force-cleaning untracked files' },
+  { pattern: /\bgit\s+stash\s+drop\b/i,              reason: 'Dropping git stash permanently' },
+  { pattern: /\bgit\s+branch\s+-[dD]\b/i,            reason: 'Deleting a git branch' },
+  { pattern: /\brm\s+-[a-z]*r[a-z]*/i,              reason: 'Recursive file deletion' },
+  { pattern: /\bchmod\b/i,                            reason: 'Changing file permissions' },
+  { pattern: /\bchown\s+-R\b/i,                       reason: 'Recursive ownership change' },
+  { pattern: /\bdocker\s+(rm|kill|stop)\b/i,         reason: 'Removing or stopping a Docker container' },
+  { pattern: /\bdocker\s+system\s+prune\b/i,         reason: 'Pruning Docker system resources' },
+  { pattern: /\bnpm\s+publish\b/i,                    reason: 'Publishing a package to npm' },
+  { pattern: /\bSet-ExecutionPolicy\b/i,              reason: 'Changing PowerShell execution policy' },
+  { pattern: /\bStop-Process\b.*-Force\b/i,           reason: 'Force-killing a process' },
+];
+
+// ─── Core Exports ─────────────────────────────────────────────────────────────
 
 /**
- * Analyze a command for safety risks with three-tier classification.
- * @param {string} command - The shell command to check
- * @returns {{ classification: 'safe'|'caution'|'dangerous', risks: Array<{reason: string, tier: string}> }}
+ * Analyze the raw user intent string (natural language, before AI).
+ * Only flags patterns that are obviously catastrophic.
  */
-export function analyzeCommand(command) {
+export function analyzeIntent(input) {
   const risks = [];
-
-  // Length check
-  if (command.length > MAX_COMMAND_LENGTH) {
-    risks.push({ reason: `Command exceeds ${MAX_COMMAND_LENGTH} character safety limit`, tier: 'dangerous' });
-  }
-
-  // Injection detection
-  for (const injection of INJECTION_PATTERNS) {
-    if (injection.test(command)) {
-      risks.push({ reason: 'Possible command injection detected', tier: 'dangerous' });
-      break;
+  if (!input || !input.trim()) return { classification: 'safe', risks };
+  for (const entry of INTENT_PATTERNS) {
+    if (entry.pattern.test(input)) {
+      risks.push({ reason: entry.reason, tier: 'dangerous' });
     }
   }
-
-  // Pattern checks
-  for (const entry of SAFETY_PATTERNS) {
-    if (entry.pattern.test(command)) {
-      risks.push({ reason: entry.reason, tier: entry.tier });
-    }
-  }
-
-  // Determine overall classification (highest tier wins)
-  let classification = 'safe';
-  if (risks.some(r => r.tier === 'dangerous')) {
-    classification = 'dangerous';
-  } else if (risks.some(r => r.tier === 'caution')) {
-    classification = 'caution';
-  }
-
-  return { classification, risks };
+  return { classification: risks.length > 0 ? 'dangerous' : 'safe', risks };
 }
 
 /**
- * Analyze an array of plan steps for safety.
- * @param {Array<{command: string}>} steps
- * @returns {{ overallClassification: 'safe'|'caution'|'dangerous', hasDangerousSteps: boolean, hasCautionSteps: boolean, analysis: Array }}
+ * Analyze a single shell command string.
+ *
+ * The full command string is checked as-is — no chain splitting, no subshell
+ * extraction.  Dangerous patterns naturally match even when the dangerous
+ * operation is embedded in a chain or $() because regex searches inside strings.
+ *
+ * Nothing is hard-blocked.  User can always proceed by typing "yes".
+ */
+export function analyzeCommand(command) {
+  if (!command || typeof command !== 'string') {
+    return { classification: 'dangerous', risks: [{ reason: 'Empty or invalid command', tier: 'dangerous' }] };
+  }
+  if (command.length > MAX_COMMAND_LENGTH) {
+    return { classification: 'dangerous', risks: [{ reason: `Command exceeds ${MAX_COMMAND_LENGTH} character safety limit`, tier: 'dangerous' }] };
+  }
+
+  // 1. Check dangerous patterns first
+  const risks = [];
+  for (const entry of DANGEROUS_PATTERNS) {
+    if (entry.pattern.test(command)) {
+      risks.push({ reason: entry.reason, tier: 'dangerous' });
+    }
+  }
+  if (risks.length > 0) {
+    return { classification: 'dangerous', risks };
+  }
+
+  // 2. Check caution patterns
+  for (const entry of CAUTION_PATTERNS) {
+    if (entry.pattern.test(command)) {
+      risks.push({ reason: entry.reason, tier: 'caution' });
+    }
+  }
+
+  return {
+    classification: risks.length > 0 ? 'caution' : 'safe',
+    risks,
+  };
+}
+
+/**
+ * Analyze an array of plan steps.
  */
 export function analyzePlan(steps) {
   const analysis = steps.map((step, i) => {
     const result = analyzeCommand(step.command);
-    return {
-      step: i + 1,
-      command: step.command,
-      ...result,
-    };
+    return { step: i + 1, command: step.command, ...result };
   });
 
   const hasDangerousSteps = analysis.some(a => a.classification === 'dangerous');
-  const hasCautionSteps = analysis.some(a => a.classification === 'caution');
+  const hasCautionSteps   = analysis.some(a => a.classification === 'caution');
+  const overallClassification = hasDangerousSteps ? 'dangerous' : hasCautionSteps ? 'caution' : 'safe';
 
-  let overallClassification = 'safe';
-  if (hasDangerousSteps) overallClassification = 'dangerous';
-  else if (hasCautionSteps) overallClassification = 'caution';
-
-  return { overallClassification, hasDangerousSteps, hasCautionSteps, analysis };
+  return {
+    overallClassification,
+    hasBlockedSteps: false,   // blocking is removed — field kept for API compat
+    hasDangerousSteps,
+    hasCautionSteps,
+    analysis,
+  };
 }
 
 /**
- * Display the execution plan to the user with safety annotations.
+ * Display the execution plan with safety markers.
+ * Command is ALWAYS shown before execution — no silent running.
  */
 export function displayPlan(steps, safetyAnalysis) {
   console.log();
-  console.log(chalk.bold.cyan('📋 Execution Plan:'));
-  console.log(chalk.dim('─'.repeat(50)));
+  console.log(chalk.bold.cyan('Plan ready'));
+  console.log(chalk.dim('---------------'));
 
   for (const item of safetyAnalysis.analysis) {
-    const stepLabel = chalk.dim(`  Step ${item.step}:`);
-    const commandStr = chalk.white.bold(item.command);
+    let bullet = chalk.cyan('-');
+    if (item.classification === 'dangerous') bullet = chalk.red('DANGER');
+    else if (item.classification === 'caution') bullet = chalk.yellow('CAUTION');
 
-    if (item.classification === 'dangerous') {
-      console.log(`${stepLabel} ${chalk.red('⛔')}  ${commandStr}`);
+    console.log(` ${bullet} ${chalk.white(item.command)}`);
+
+    if (item.classification !== 'safe') {
       for (const risk of item.risks) {
-        console.log(chalk.red(`           ⛔  ${risk.reason}`));
+        const color = risk.tier === 'dangerous' ? chalk.red : chalk.yellow;
+        console.log(`   -> ${color(risk.reason)}`);
       }
-    } else if (item.classification === 'caution') {
-      console.log(`${stepLabel} ${chalk.yellow('⚠')}  ${commandStr}`);
-      for (const risk of item.risks) {
-        console.log(chalk.yellow(`           ⚠  ${risk.reason}`));
-      }
-    } else {
-      console.log(`${stepLabel} ${chalk.green('✓')}  ${commandStr}`);
     }
   }
 
-  console.log(chalk.dim('─'.repeat(50)));
-
-  if (safetyAnalysis.hasDangerousSteps) {
-    console.log(chalk.red.bold('\n⛔  DANGER: This plan contains potentially destructive commands!'));
-    console.log(chalk.red('   You will need to type "yes" to confirm.\n'));
-  } else if (safetyAnalysis.hasCautionSteps) {
-    console.log(chalk.yellow.bold('\n⚠  CAUTION: Some commands in this plan require care.'));
-    console.log(chalk.yellow('   Review each step before proceeding.\n'));
-  }
+  console.log(chalk.dim('---------------'));
 }
 
 /**
- * Prompt the user for confirmation via readline.
- * @param {string} message
- * @param {boolean} isDangerous - If true, requires typing "yes" instead of just "y"
- * @returns {Promise<'yes'|'no'|'edit'>}
+ * Prompt the user for confirmation before running.
+ * Dangerous commands require typing the full word "yes".
+ * Caution commands accept y / n / edit.
  */
 export function promptConfirmation(message, isDangerous = false) {
   return new Promise((resolve) => {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
     const options = isDangerous
-      ? `${chalk.yellow('Type "yes" to confirm, "no" to cancel')}: `
-      : `${chalk.cyan('(y)es / (n)o / (e)dit')}: `;
+      ? `${chalk.red.bold('Dangerous command')} — type "yes" to confirm: `
+      : `${chalk.yellow('Confirm')}: (y)es / (n)o / (e)dit: `;
 
-    rl.question(`${message} ${options}`, (answer) => {
+    rl.question(`\n${message || ''}\n${options}`, (answer) => {
       rl.close();
       const a = answer.trim().toLowerCase();
-
-      if (isDangerous) {
-        resolve(a === 'yes' ? 'yes' : 'no');
-      } else {
-        if (a === 'y' || a === 'yes') resolve('yes');
-        else if (a === 'e' || a === 'edit') resolve('edit');
-        else resolve('no');
-      }
+      if (isDangerous)             resolve(a === 'yes' ? 'yes' : 'no');
+      else if (a === 'y' || a === 'yes') resolve('yes');
+      else if (a === 'e' || a === 'edit') resolve('edit');
+      else                         resolve('no');
     });
   });
 }
