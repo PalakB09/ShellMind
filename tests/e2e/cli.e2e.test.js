@@ -23,6 +23,7 @@ function makeEnv(home, extra = {}) {
     USERPROFILE: home,
     GEMINI_API_KEY: '',
     OPENROUTER_API_KEY: '',
+    OLLAMA_HOST: 'http://localhost:1', // Dead port for testing fallback
     NO_COLOR: '1',
     ...extra,
   };
@@ -96,7 +97,7 @@ test('routing: global workflow named list overrides list subcommand', async () =
 test('routing: ai list files is natural language, not list subcommand', async () => {
   const s = makeSandbox('routing-list-files');
   const out = await runCLI(['list', 'files', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('routing: quoted list files matches repo workflow exactly', async () => {
@@ -137,13 +138,13 @@ test('routing: ai run deploy runs named global workflow', async () => {
 test('routing: unknown command reaches no-key AI fallback', async () => {
   const s = makeSandbox('routing-unknown');
   const out = await runCLI(['frobnicate', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('routing: dry-run flag is preserved for natural language reroute', async () => {
   const s = makeSandbox('routing-dry-run-propagates');
   const out = await runCLI(['list', 'all', 'files', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
   assert.doesNotMatch(out.text, /Execute this plan/);
 });
 
@@ -256,21 +257,21 @@ test('repo workflows: malformed unclosed fence is rejected gracefully', async ()
   const s = makeSandbox('repo-malformed');
   writeRepo(s.cwd, '## broken\nBad\n```bash\necho BAD\n');
   const out = await runCLI(['broken', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('repo workflows: workflow without code block is ignored gracefully', async () => {
   const s = makeSandbox('repo-no-code');
   writeRepo(s.cwd, '## docs\nJust prose\n');
   const out = await runCLI(['docs', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('repo workflows: multiple code blocks are rejected explicitly by parser policy', async () => {
   const s = makeSandbox('repo-multiple-codeblocks');
   writeRepo(s.cwd, '## multi\nDesc\n```bash\necho ONE\n```\n```bash\necho TWO\n```\n');
   const out = await runCLI(['multi', '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('repo workflows: strips UTF-8 BOM', async () => {
@@ -481,7 +482,7 @@ test('no-key: global workflows work without API key', async () => {
 test('no-key: unknown command is graceful', async () => {
   const s = makeSandbox('nokey-unknown');
   const out = await runCLI(['unknown thing'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('no-key: chat starts and exits cleanly', async () => {
@@ -513,7 +514,7 @@ test('edge: invalid config JSON is ignored gracefully', async () => {
   fs.mkdirSync(path.join(s.home, '.ai-cli'), { recursive: true });
   fs.writeFileSync(path.join(s.home, '.ai-cli', 'config.json'), '{bad', 'utf8');
   const out = await runCLI(['unknown'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('edge: corrupted global commands JSON does not crash', async () => {
@@ -533,7 +534,7 @@ test('edge: missing ai-commands.md does not crash', async () => {
 test('edge: very long input does not crash and is graceful without key', async () => {
   const s = makeSandbox('edge-long-input');
   const out = await runCLI(['x'.repeat(5000), '--dry-run'], { sandbox: s });
-  assert.match(out.text, /AI generation is disabled/);
+  assert.match(out.text, /No AI provider reachable/);
 });
 
 test('edge: invalid workflow name on save is reported', async () => {

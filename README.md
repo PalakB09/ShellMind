@@ -37,27 +37,29 @@ Unlike traditional AI wrappers, this tool is built for speed. When you enter a c
 2.  **Global Workflows (`~/.ai-cli/commands.json`)**: Universal macros saved across your machine.
 3.  **Intent Memory (0-Latency Cache)**: If you've run a specific natural language instruction before via AI, we cache the result globally. Second-time executions are **instant** and offline.
 4.  **Built-In Defaults**: Hardcoded `setup`, `dev`, `test`, `deploy`, and `reset` commands optimized for Node, Docker, and Python environments.
-5.  **Autonomous AI**: Intelligent generation via Gemini/OpenRouter only if all local memory layers fail.
+5.  **Local AI (Ollama)**: Intelligent generation via `llama3.2:1b` running locally on your hardware. **100% Private, Zero Latency.**
+6.  **Cloud AI Fallback (Gemini)**: Native fallback to Gemini models only if Ollama is unreachable.
 
 ---
 
-## 🟢 MODE 1: The AI Co-Pilot (API Enabled)
+## 🟢 MODE 1: The AI Co-Pilot (Ollama First)
 
-If all memory layers fail, the tool transforms into an intelligent shell agent. It parses your natural language, writes OS-specific shell commands, and automatically self-heals terminal errors.
+If all memory layers fail, the tool transforms into an intelligent shell agent. It prioritizes **Local Ollama** for privacy and falls back to **Google Gemini** for high-tier cloud processing.
 
 ### 🔑 Configuration Setup
-Create a globally accessible configuration file at `~/.ai-cli/config.json`:
+The CLI automatically detects **Ollama** if it is running on `localhost:11434`. No key required.
+
+For Cloud Fallback, provide a **Gemini** API key in your globally accessible configuration file at `~/.ai-cli/config.json`:
 
 ```json
 {
-  "provider": "gemini",
-  "apiKeys": { "gemini": "YOUR_KEY" },
-  "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
+  "provider": "ollama",
+  "apiKeys": { "gemini": "YOUR_GEMINI_KEY" }
 }
 ```
 *(You can also simply drop a `.env` file containing `GEMINI_API_KEY` into your current working directory).*
 
-**Smart Network Routing:** Our built-in intelligence dynamically cascades between your specified models. If `gemini-2.5-pro` hits an HTTP 429 Rate Limit, we instantly funnel the execution down to `gemini-2.5-flash` so you physically never experience a crash!
+**Robust Routing:** Our built-in intelligence dynamically cascades between providers. If Ollama is down, we instantly switch to Gemini. If the AI returns multiple lines or conversational filler, we trigger a "Self-Healing" retry to ensure only raw shell commands reach your terminal.
 
 
 ### ✨ Feature 1: Single Shot Execution (`ai <instruction>`)

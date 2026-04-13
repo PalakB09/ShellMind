@@ -32,9 +32,7 @@ export async function saveLastPlan(name, options = {}) {
   }
 
   let targetScope = options.scope;
-  if (name === 'deploy-plan') console.error('DEBUG PLANNER SCOPE:', JSON.stringify(targetScope));
   if (targetScope === null) {
-    console.trace('TRACE: targetScope is null');
     const choice = await askInput('Save to: (g)lobal / (r)epo? (default: global)');
     targetScope = choice.toLowerCase().startsWith('r') ? 'local' : 'global';
   } else if (!targetScope) {
@@ -213,11 +211,6 @@ export async function runPipeline(instruction, options = {}) {
   }
 
   if (!intent) {
-    if (!usesAI) {
-      console.log(chalk.yellow('\n⚠ No matching workflow found. AI generation is disabled because no API key is configured.\n'));
-      return { success: false, results: null, plan: null };
-    }
-
     isFromAI = true;
     intent = await parseIntent(instruction, history);
     

@@ -6,9 +6,9 @@ const CONFIG_DIR = path.join(os.homedir(), '.ai-cli');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
 const DEFAULT_CONFIG = {
-  provider: 'openrouter',
-  apiKeys: {}, // { gemini: '...', openrouter: '...' }
-  models: [], // E.g., ['meta-llama/llama-3.3-70b-instruct:free', 'google/gemma-3-27b-it:free']
+  provider: 'ollama',
+  apiKeys: {}, // { gemini: '...' }
+  models: ['llama3.2:1b'],
   defaultMode: 'execute'
 };
 
@@ -42,21 +42,16 @@ export function getConfig() {
   const merged = {
     provider: fileConfig.provider || DEFAULT_CONFIG.provider,
     apiKeys: {
-      gemini: fileConfig.apiKeys?.gemini || process.env.GEMINI_API_KEY || null,
-      openrouter: fileConfig.apiKeys?.openrouter || process.env.OPENROUTER_API_KEY || null
+      gemini: fileConfig.apiKeys?.gemini || process.env.GEMINI_API_KEY || null
     },
-    models: Array.isArray(fileConfig.models) ? fileConfig.models : DEFAULT_CONFIG.models,
+    models: Array.isArray(fileConfig.models) && fileConfig.models.length > 0 ? fileConfig.models : DEFAULT_CONFIG.models,
     defaultMode: fileConfig.defaultMode || DEFAULT_CONFIG.defaultMode,
     geminiFallbackCache: Array.isArray(fileConfig.geminiFallbackCache) ? fileConfig.geminiFallbackCache : null
   };
 
-  // Auto-detect provider if none explicitly set in file, but keys exist
+  // Always enforce ollama as default primary provider if missing in config
   if (!fileConfig.provider) {
-    if (merged.apiKeys.gemini && !merged.apiKeys.openrouter) {
-      merged.provider = 'gemini';
-    } else if (merged.apiKeys.openrouter) {
-      merged.provider = 'openrouter';
-    }
+    merged.provider = 'ollama';
   }
 
   return merged;
@@ -69,7 +64,8 @@ export function getConfig() {
  */
 export function hasAnyApiKey() {
   const config = getConfig();
-  return !!(config.apiKeys.gemini || config.apiKeys.openrouter);
+  // We return true if a gemini key exists OR if the provider is ollama (which requires no key)
+  return !!(config.apiKeys.gemini || config.provider === 'ollama');
 }
 
 /**
