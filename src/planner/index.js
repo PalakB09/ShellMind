@@ -5,12 +5,18 @@ import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { parseIntent, explainError } from '../intent/index.js';
+import { parseIntent, parseIntentWithErrorContext, explainError } from '../intent/index.js';
 import { analyzeIntent, analyzePlan, displayPlan, promptConfirmation } from '../safety/index.js';
 import { executePlan } from '../executor/index.js';
 import { saveCommand, loadCommand, commandExists } from '../memory/index.js';
 import { checkIntentMemory, cacheSuccessfulIntent } from '../memory/intent.js';
 import { getBuiltInWorkflow } from '../memory/defaults.js';
+import { recordExecution } from '../context/command-history.js';
+import { repairFailedStep } from '../intent/repair.js';
+import { logAI, logExec, logSuccess } from '../cli/format.js';
+import { buildExecutionIntent } from '../pipeline/index.js';
+import { sanitizeSteps } from '../pipeline/sanitizer.js';
+import { validateSteps } from '../pipeline/validator.js';
 
 const MAX_PIPELINE_DEPTH = 3;  // Prevent infinite retry/clarification loops
 const LAST_PLAN_FILE = path.join(os.homedir(), '.ai-cli', 'last-plan.json');
@@ -19,9 +25,24 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+// Name validation pattern — mirrors memory/index.js to catch errors before any I/O.
+const NAME_PATTERN = /^[a-zA-Z0-9_\-]+$/;
+const MAX_COMMAND_NAME_LENGTH = 50;
+
 export async function saveLastPlan(name, options = {}) {
   if (!name) {
     console.log(chalk.yellow('\nUsage: ai save <name> [--global|--repo]\n'));
+    return;
+  }
+
+  // Validate name FIRST — before any disk access or interactive prompts.
+  // This ensures validation errors surface immediately, not after the scope prompt.
+  if (name.length > MAX_COMMAND_NAME_LENGTH) {
+    console.log(chalk.red(`\nCommand name must be ${MAX_COMMAND_NAME_LENGTH} characters or fewer.\n`));
+    return;
+  }
+  if (!NAME_PATTERN.test(name)) {
+    console.log(chalk.red('\nCommand name may only contain letters, numbers, hyphens, and underscores.\n'));
     return;
   }
 
@@ -67,6 +88,7 @@ function askInput(prompt) {
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
+      terminal: false,
     });
     rl.question(chalk.cyan(`  ${prompt}: `), (answer) => {
       rl.close();
@@ -155,11 +177,11 @@ async function resolveInputs(steps) {
  * @returns {Promise<{success: boolean, results: Array|null, plan: object|null}>}
  */
 export async function runPipeline(instruction, options = {}) {
-  const { history = [], autoExecute = false, dryRun = false, _depth = 0 } = options;
+  const { history = [], autoExecute = false, dryRun = false, _depth = 0, _overrideIntent = null } = options;
 
-  // Guard: Graceful degradation (No-Key Mode)
-  const { hasAnyApiKey } = await import('../config/index.js');
-  const usesAI = hasAnyApiKey();
+  // Note: Provider availability is handled at runtime by the AI router.
+  // No early gating needed here — the pipeline works with deterministic
+  // intents even when no AI provider is reachable.
 
   // Guard: prevent infinite loops
   if (_depth >= MAX_PIPELINE_DEPTH) {
@@ -170,15 +192,24 @@ export async function runPipeline(instruction, options = {}) {
   let intent = null;
   let isFromAI = false;
 
+  // Shortcut: a corrected intent was already parsed by parseIntentWithErrorContext — skip all lookups.
+  if (_overrideIntent) {
+    intent = _overrideIntent;
+    isFromAI = true;
+    intent.__source = 'ai';
+  }
+
   // ─── 1. Waterfall Memory Check ────────────────────────ــــ─
 
   // Attempt to load natively without AI by exactly matching instruction string
   const normalizedInst = instruction.trim();
 
   // A. Local Workflow (ai-commands.md)
-  let nativeObj = loadCommand(normalizedInst);
-  if (nativeObj) {
-    intent = { name: normalizedInst, ...nativeObj };
+  if (!intent) {
+    const nativeObj = loadCommand(normalizedInst);
+    if (nativeObj) {
+      intent = { name: normalizedInst, ...nativeObj };
+    }
   }
 
   // B. Global Workflow (~/.ai-cli/commands.json)
@@ -211,8 +242,12 @@ export async function runPipeline(instruction, options = {}) {
   }
 
   if (!intent) {
-    isFromAI = true;
-    intent = await parseIntent(instruction, history);
+    const planningResult = await buildExecutionIntent(instruction, {
+      history,
+      cwd: process.cwd(),
+    });
+    intent = planningResult.intent;
+    isFromAI = planningResult.source === 'ai';
     
     if (!intent) {
       return { success: false, results: null, plan: null };
@@ -244,10 +279,23 @@ export async function runPipeline(instruction, options = {}) {
   }
 
   // Step 3: Resolve user inputs (placeholders)
-  const resolvedSteps = await resolveInputs(intent.steps || intent.commands.map(c => ({ command: c, description: c })));
+  const resolvedSteps = sanitizeSteps(await resolveInputs(intent.steps || intent.commands.map(c => ({ command: c, description: c }))));
 
   if (resolvedSteps.length === 0) {
     console.log(chalk.yellow('\nAll steps were skipped. Nothing to execute.'));
+    return { success: false, results: null, plan: intent };
+  }
+
+  const validationResult = validateSteps(resolvedSteps);
+  if (!validationResult.valid) {
+    console.log(chalk.red('\nInvalid command rejected before execution.\n'));
+    for (const issue of validationResult.issues) {
+      console.log(chalk.red(`Step ${issue.step}: ${issue.command}`));
+      for (const error of issue.errors) {
+        console.log(chalk.red(`  - ${error}`));
+      }
+    }
+    console.log();
     return { success: false, results: null, plan: intent };
   }
 
@@ -258,86 +306,128 @@ export async function runPipeline(instruction, options = {}) {
     steps: resolvedSteps,
   });
 
-  // Step 5: Display plan
-  displayPlan(resolvedSteps, safetyResult);
+  // Step 5+7: Display plan and confirmation
+  // Deterministic + safe commands (e.g. "git status") auto-execute with no ceremony.
+  // AI-generated or risky commands always show the plan and require confirmation.
+  const isDeterministic = intent.__source === 'deterministic';
+  const isSafe = !safetyResult.hasDangerousSteps && !safetyResult.hasCautionSteps;
+  const skipConfirmation = isDeterministic && isSafe && !dryRun;
+
+  if (!skipConfirmation) {
+    displayPlan(resolvedSteps, safetyResult);
+  }
 
   // Step 6: Dry-run mode — stop here
   if (dryRun) {
+    if (skipConfirmation) displayPlan(resolvedSteps, safetyResult); // still show in dry-run
     console.log(chalk.cyan('\n📝 Dry run mode — no commands executed.\n'));
     return { success: true, results: null, plan: intent };
   }
 
-  // Step 7: Confirmation
-  // In auto mode: skip confirmation for safe, but confirm caution and dangerous
-  if (!autoExecute || safetyResult.hasDangerousSteps || safetyResult.hasCautionSteps) {
-    const confirmMsg = safetyResult.hasDangerousSteps
-      ? chalk.red.bold('\n⚡ Execute these commands?')
-      : safetyResult.hasCautionSteps
-        ? chalk.yellow.bold('\n⚡ Execute these commands?')
-        : chalk.cyan('\n⚡ Execute this plan?');
+  // Step 7: Confirmation (skip for safe deterministic commands)
+  if (!skipConfirmation) {
+    if (!autoExecute || safetyResult.hasDangerousSteps || safetyResult.hasCautionSteps) {
+      const confirmMsg = safetyResult.hasDangerousSteps
+        ? chalk.red.bold('\n⚡ Execute these commands?')
+        : safetyResult.hasCautionSteps
+          ? chalk.yellow.bold('\n⚡ Execute these commands?')
+          : chalk.cyan('\n⚡ Execute this plan?');
 
-    const answer = await promptConfirmation(confirmMsg, safetyResult.hasDangerousSteps);
+      const answer = await promptConfirmation(confirmMsg, safetyResult.hasDangerousSteps);
 
-    if (answer === 'no') {
-      console.log(chalk.yellow('\n✋ Cancelled.\n'));
-      return { success: false, results: null, plan: intent };
-    }
-
-    if (answer === 'edit') {
-      console.log(chalk.yellow('\n✏ Please re-phrase your instruction:\n'));
-      const newInstruction = await askInput('New instruction');
-
-      if (!newInstruction) {
-        console.log(chalk.yellow('\n✋ No input provided. Cancelling.\n'));
+      if (answer === 'no') {
+        console.log(chalk.yellow('\n✋ Cancelled.\n'));
         return { success: false, results: null, plan: intent };
       }
 
-      return runPipeline(newInstruction, { ...options, _depth: _depth + 1 });
+      if (answer === 'edit') {
+        console.log(chalk.yellow('\n✏ Please re-phrase your instruction:\n'));
+        const newInstruction = await askInput('New instruction');
+
+        if (!newInstruction) {
+          console.log(chalk.yellow('\n✋ No input provided. Cancelling.\n'));
+          return { success: false, results: null, plan: intent };
+        }
+
+        return runPipeline(newInstruction, { ...options, _depth: _depth + 1 });
+      }
     }
   }
 
   // Step 8: Execute
-  console.log(chalk.bold.green('\n🚀 Executing...\n'));
-  const executionResult = await executePlan(resolvedSteps);
+  logExec('Executing plan');
+  const executionResult = await executePlan(resolvedSteps, {
+    repairStep: isFromAI
+      ? ({ failedStep }) => repairFailedStep({ failedStep, instruction })
+      : null,
+  });
+  recordExecution({
+    cwd: process.cwd(),
+    instruction,
+    steps: resolvedSteps,
+    results: executionResult.results,
+  });
 
   // Step 9: Error handling + self-healing (with depth guard)
   if (!executionResult.allSucceeded) {
     const failedStep = executionResult.results.find(r => !r.success);
     if (failedStep) {
-      console.log(chalk.red.bold('\n─── Error Analysis ───'));
-      const explanation = await explainError(
-        failedStep.command,
-        failedStep.stderr,
-        failedStep.stdout
-      );
-      console.log(chalk.white('\n' + explanation));
-      console.log(chalk.dim('─'.repeat(50)));
+      const isDeterministicFailure = intent.__source === 'deterministic';
+      if (isDeterministicFailure) {
+        const conciseError = (failedStep.stderr || 'Command failed.')
+          .split('\n')
+          .map((line) => line.trim())
+          .find(Boolean) || 'Command failed.';
+        console.log(chalk.red(`\n${conciseError}\n`));
+      } else {
+        logAI('Analyzing failed step');
+        const explanation = await explainError(
+          failedStep.command,
+          failedStep.stderr,
+          failedStep.stdout
+        );
+        console.log(chalk.white('\n' + explanation));
+        console.log(chalk.dim('─'.repeat(50)));
+      }
 
       // Only offer retry if we haven't hit max depth
-      if (_depth < MAX_PIPELINE_DEPTH - 1) {
+      if (!isDeterministicFailure && _depth < MAX_PIPELINE_DEPTH - 1) {
         const retryAnswer = await promptConfirmation(
           chalk.yellow('\n🔄 Would you like to try a corrected approach?')
         );
 
         if (retryAnswer === 'yes') {
-          const retryInstruction = `The previous command failed: "${failedStep.command}"
-Error: ${(failedStep.stderr || '').substring(0, 500)}
-Original goal: ${instruction}
-Please suggest a corrected approach.`;
+          // Use parseIntentWithErrorContext so the model sees the real error as a
+          // conversation turn — not as a new free-text instruction it can hallucinate about.
+          const correctedIntent = await parseIntentWithErrorContext(
+            instruction,
+            failedStep.command,
+            failedStep.stderr || ''
+          );
 
-          return runPipeline(retryInstruction, { ...options, _depth: _depth + 1 });
+          if (!correctedIntent || !correctedIntent.steps?.length) {
+            console.log(chalk.yellow('\n⟋ Could not generate a corrected plan. Try rephrasing your request.\n'));
+          } else {
+            return runPipeline(instruction, {
+              ...options,
+              _depth: _depth + 1,
+              _overrideIntent: correctedIntent,
+            });
+          }
         }
       } else {
-        console.log(chalk.yellow('\n⚠ Max retry depth reached. Please try a different approach manually.\n'));
+        if (!isDeterministicFailure) {
+          console.log(chalk.yellow('\n⚠ Max retry depth reached. Please try a different approach manually.\n'));
+        }
       }
     }
   } else {
-    console.log(chalk.green.bold('\n✅ Done!\n'));
+      logSuccess('Plan completed successfully.');
 
-    if (isFromAI) {
-      cacheSuccessfulIntent(instruction, resolvedSteps);
-      console.log(chalk.dim(`💡 Run this often? Save it as a workflow: ai save <name>\n`));
-    }
+      if (isFromAI) {
+        cacheSuccessfulIntent(instruction, resolvedSteps);
+        console.log(chalk.dim(`💡 Run this often? Save it as a workflow: ai save <name>\n`));
+      }
   }
 
   return {

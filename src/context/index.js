@@ -1,6 +1,7 @@
-// Context Engine — detects project type, available scripts, and gathers directory context.
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
+import { formatLatestCommandContext } from './command-history.js';
 
 const PROJECT_MARKERS = [
   { file: 'package.json', type: 'node', label: 'Node.js' },
@@ -83,6 +84,16 @@ export function buildContextSummary(dir = process.cwd()) {
 
   if (project.hasGit) {
     lines.push(`Git repository: yes`);
+    try {
+      const gitStatus = execSync('git status --short', { cwd: dir, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (gitStatus) {
+        lines.push(`Modified files (git status -s):\n${gitStatus.split('\n').map(l => `  ${l}`).join('\n')}`);
+      } else {
+        lines.push(`Git status: clean`);
+      }
+    } catch {
+      // Ignore if git fails (e.g., git not installed)
+    }
   }
 
   if (project.types.length > 0) {
@@ -105,5 +116,92 @@ export function buildContextSummary(dir = process.cwd()) {
     listing.forEach(l => lines.push(`  ${l}`));
   }
 
+  lines.push(`\nLatest terminal context:`);
+  lines.push(formatLatestCommandContext(dir));
+
   return lines.join('\n');
+}
+
+export function getGitStatusEntries(dir = process.cwd()) {
+  try {
+    const gitStatus = execSync('git status --short', {
+      cwd: dir,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+
+    if (!gitStatus) return [];
+
+    return gitStatus
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const withoutStatus = line.replace(/^[A-Z? ]{1,3}/, '').trim();
+        const pathPart = withoutStatus.includes('->')
+          ? withoutStatus.split('->').at(-1).trim()
+          : withoutStatus;
+        const extension = path.extname(pathPart).slice(1).toLowerCase();
+        const normalized = pathPart.replace(/\\/g, '/').toLowerCase();
+        const kind = normalized.includes('/logs/') || normalized.endsWith('.log')
+          ? 'logs'
+          : extension || 'file';
+
+        return {
+          path: pathPart,
+          kind,
+          extension,
+          timestamp: null,
+          sourceLine: line,
+        };
+      });
+  } catch {
+    return [];
+  }
+}
+
+export function getWorkspaceEntries(dir = process.cwd(), baseDir = dir) {
+  const entries = [];
+  const ignoredDirs = new Set(['.git', 'node_modules']);
+
+  try {
+    const children = fs.readdirSync(dir, { withFileTypes: true });
+
+    for (const child of children) {
+      if (ignoredDirs.has(child.name)) continue;
+
+      const fullPath = path.join(dir, child.name);
+      const relativePath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+
+      if (child.isDirectory()) {
+        entries.push({
+          path: `${relativePath}/`,
+          kind: 'directory',
+          extension: '',
+          timestamp: null,
+          sourceLine: relativePath,
+        });
+        entries.push(...getWorkspaceEntries(fullPath, baseDir));
+        continue;
+      }
+
+      const extension = path.extname(child.name).slice(1).toLowerCase();
+      const normalized = relativePath.toLowerCase();
+      const kind = normalized.includes('/logs/') || normalized.endsWith('.log')
+        ? 'logs'
+        : extension || 'file';
+
+      entries.push({
+        path: relativePath,
+        kind,
+        extension,
+        timestamp: null,
+        sourceLine: relativePath,
+      });
+    }
+  } catch {
+    return [];
+  }
+
+  return entries;
 }

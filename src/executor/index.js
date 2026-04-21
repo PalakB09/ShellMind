@@ -3,6 +3,7 @@
 import { spawn } from 'child_process';
 import chalk from 'chalk';
 import { getShellConfig } from '../os-adapter/index.js';
+import { logError, logExec, logSuccess, writeCommandOutput, writeSystemError } from '../cli/format.js';
 
 const DEFAULT_TIMEOUT_MS = 120_000;  // 2 minute timeout per command
 const MAX_OUTPUT_SIZE = 1_000_000;   // ~1MB output cap per stream
@@ -70,7 +71,7 @@ export function executeCommand(command, options = {}) {
         stdout += '\n[... output truncated ...]';
       }
       if (!silent) {
-        process.stdout.write(chalk.dim(text));
+        writeCommandOutput(text);
       }
     });
 
@@ -83,7 +84,7 @@ export function executeCommand(command, options = {}) {
         stderr += '\n[... output truncated ...]';
       }
       if (!silent) {
-        process.stderr.write(chalk.yellow(text));
+        writeSystemError(text);
       }
     });
 
@@ -123,29 +124,22 @@ export function executeCommand(command, options = {}) {
  * @returns {Promise<{results: Array<{step: number, command: string, ...result}>, allSucceeded: boolean}>}
  */
 export async function executePlan(steps, options = {}) {
-  const { cwd, continueOnError = false, timeout } = options;
+  const { cwd, continueOnError = false, timeout, repairStep, runner = executeCommand } = options;
   const results = [];
+  let overallSuccess = true;
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    console.log();
-    console.log(chalk.bold.cyan(`▶ Step ${i + 1}/${steps.length}: `) + chalk.white(step.description || step.command));
-    console.log(chalk.dim(`  $ ${step.command}`));
-    console.log();
+    logExec(`Running: ${step.command}`);
 
-    const result = await executeCommand(step.command, { cwd, timeout });
+    const result = await runner(step.command, { cwd, timeout });
 
     if (result.timedOut) {
-      console.log(chalk.red(`\n✗ Step ${i + 1} timed out after ${(timeout || DEFAULT_TIMEOUT_MS) / 1000}s.`));
+      logError(`Step ${i + 1} timed out after ${(timeout || DEFAULT_TIMEOUT_MS) / 1000}s.`);
     } else if (result.success) {
-      console.log(chalk.green(`\n✓ Step ${i + 1} completed successfully.`));
+      logSuccess(`Step ${i + 1} completed successfully.`);
     } else {
-      console.log(chalk.red(`\n✗ Step ${i + 1} failed (exit code ${result.exitCode}).`));
-      if (result.stderr) {
-        // Show first 3 lines of error
-        const errorLines = result.stderr.split('\n').slice(0, 3).join('\n');
-        console.log(chalk.red(`  Error: ${errorLines}`));
-      }
+      logError(`Step ${i + 1} failed (exit code ${result.exitCode}).`);
     }
 
     results.push({
@@ -155,14 +149,37 @@ export async function executePlan(steps, options = {}) {
       ...result,
     });
 
-    if (!result.success && !continueOnError) {
-      console.log(chalk.yellow('\n⚠ Execution halted due to failure.'));
-      break;
+    if (!result.success) {
+      if (typeof repairStep === 'function') {
+        const repaired = await repairStep({ failedStep: { ...results[results.length - 1] }, index: i, steps, results: [...results] });
+        if (repaired?.command) {
+          logExec(`Retrying with corrected command: ${repaired.command}`);
+          const retryResult = await runner(repaired.command, { cwd, timeout });
+          results.push({
+            step: i + 1,
+            command: repaired.command,
+            description: repaired.description || repaired.command,
+            repairedFrom: step.command,
+            ...retryResult,
+          });
+
+          if (retryResult.success) {
+            logSuccess(`Recovered step ${i + 1} with corrected command.`);
+            continue;
+          }
+        }
+      }
+
+      overallSuccess = false;
+      if (!continueOnError) {
+        logError('Execution halted due to failure.');
+        break;
+      }
     }
   }
 
   return {
     results,
-    allSucceeded: results.every(r => r.success),
+    allSucceeded: overallSuccess,
   };
 }

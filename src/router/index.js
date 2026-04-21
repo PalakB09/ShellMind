@@ -4,9 +4,10 @@ import { loadCommand, listCommands, fuzzyMatchCommand, deleteCommand, commandExi
 import { getBuiltInWorkflow } from '../memory/defaults.js';
 import { executeSavedWorkflow } from '../cli/workflows.js';
 import { startChat } from '../cli/chat.js';
+import { runInit } from '../cli/init.js';
 
 const VERSION = '1.0.0';
-const SUBCOMMANDS = new Set(['chat', 'save', 'run', 'list', 'delete', 'setup', 'help']);
+const SUBCOMMANDS = new Set(['chat', 'save', 'run', 'list', 'delete', 'setup', 'init', 'help']);
 
 function printHelp() {
   console.log(`Usage: ai [options] [instruction...]
@@ -14,12 +15,13 @@ function printHelp() {
 AI-powered CLI assistant - workflow engine first, AI assistant second
 
 Options:
-  -v, --version       output the version number
+  -v, --version       Output the version number
   --dry-run           Show plan without executing
   --auto              Auto-execute safe plans
-  -h, --help          display help
+  -h, --help          Display help
 
 Commands:
+  init                Configure AI provider and model (run this first)
   chat                Start an interactive AI chat session
   save <name>         Save the last plan as a workflow
   run <name>          Run a saved workflow
@@ -143,6 +145,11 @@ async function runSubcommand(words, options) {
     return;
   }
 
+  if (cmd === 'init') {
+    await runInit();
+    return;
+  }
+
   if (cmd === 'chat') {
     await startChat(planOptions(options));
     return;
@@ -187,7 +194,7 @@ function isExactSubcommand(words) {
   if (words.length === 0) return false;
   const [cmd, ...rest] = words;
   if (!SUBCOMMANDS.has(cmd)) return false;
-  if (cmd === 'list' || cmd === 'chat' || cmd === 'setup' || cmd === 'help') return rest.length === 0;
+  if (cmd === 'list' || cmd === 'chat' || cmd === 'setup' || cmd === 'init' || cmd === 'help') return rest.length === 0;
   if (cmd === 'save' || cmd === 'run' || cmd === 'delete') return true;
   return false;
 }

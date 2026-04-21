@@ -1,7 +1,7 @@
 {
-  "name": "ai-cli-assistant",
+  "name": "shellmind",
   "version": "1.0.0",
-  "description": "AI-powered CLI assistant — control your terminal with natural language",
+  "description": "A context-aware AI system that understands your terminal and executes reliably",
   "type": "module",
   "bin": {
     "ai": "./src/index.js"
@@ -13,9 +13,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node tests/e2e/cli.e2e.test.js"
+    "test": "node tests/all.test.js"
   },
-  "keywords": ["cli", "ai", "terminal", "assistant", "gemini"],
+  "keywords": ["cli", "ai", "terminal", "assistant", "gemini", "ollama", "llm", "shell", "developer-tools", "workflow", "automation"],
   "license": "MIT",
   "dependencies": {
     "@google/genai": "^1.0.0",

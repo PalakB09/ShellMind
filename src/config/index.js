@@ -7,14 +7,16 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
 const DEFAULT_CONFIG = {
   provider: 'ollama',
-  apiKeys: {}, // { gemini: '...' }
-  models: ['llama3.2:1b'],
-  defaultMode: 'execute'
+  apiKeys: {},
+  // Models are intentionally NOT hardcoded — they must be set via `ai init`.
+  // Having null here means the AI router will skip local/cloud if not configured.
+  models: {
+    local: null,
+    cloud: null,
+  },
+  defaultMode: 'execute',
 };
 
-/**
- * Ensures the config directory exists.
- */
 function ensureConfigDir() {
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
@@ -22,12 +24,12 @@ function ensureConfigDir() {
 }
 
 /**
- * Loads the user configuration and merges it with process.env
+ * Loads and merges user config with environment variables and defaults.
  * @returns {object} Merged configuration object
  */
 export function getConfig() {
   let fileConfig = {};
-  
+
   if (fs.existsSync(CONFIG_FILE)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
@@ -35,58 +37,69 @@ export function getConfig() {
         fileConfig = parsed;
       }
     } catch {
-      // Ignore parse errors, fallback to default
+      // Ignore parse errors, fall back to defaults
     }
   }
 
-  const merged = {
+  return {
     provider: fileConfig.provider || DEFAULT_CONFIG.provider,
     apiKeys: {
-      gemini: fileConfig.apiKeys?.gemini || process.env.GEMINI_API_KEY || null
+      gemini: fileConfig.apiKeys?.gemini || process.env.GEMINI_API_KEY || null,
     },
-    models: Array.isArray(fileConfig.models) && fileConfig.models.length > 0 ? fileConfig.models : DEFAULT_CONFIG.models,
+    // Deep merge models — use file config ONLY, no fallback hardcoded values.
+    models: {
+      local: fileConfig.models?.local || process.env.AI_LOCAL_MODEL || null,
+      cloud: fileConfig.models?.cloud || process.env.AI_CLOUD_MODEL || null,
+    },
     defaultMode: fileConfig.defaultMode || DEFAULT_CONFIG.defaultMode,
-    geminiFallbackCache: Array.isArray(fileConfig.geminiFallbackCache) ? fileConfig.geminiFallbackCache : null
   };
-
-  // Always enforce ollama as default primary provider if missing in config
-  if (!fileConfig.provider) {
-    merged.provider = 'ollama';
-  }
-
-  return merged;
 }
 
 /**
- * Checks if the system has any usable API keys available.
- * Required to determine if we should fall back to No-Key Mode.
- * @returns {boolean} True if any API key exists.
+ * Returns true if ANY AI provider is configured — either a local Ollama model
+ * has been selected via `ai init`, or a Gemini API key is present.
+ * Returns false in 'No AI' mode (provider === 'none').
+ * Ollama reachability is checked at runtime in the router; this only checks config.
  */
 export function hasAnyApiKey() {
   const config = getConfig();
-  // We return true if a gemini key exists OR if the provider is ollama (which requires no key)
-  return !!(config.apiKeys.gemini || config.provider === 'ollama');
+  if (config.provider === 'none') return false;
+  return !!(config.apiKeys?.gemini || config.models?.local);
 }
 
 /**
- * Save configuration to the config file
- * @param {object} newConfig Partial configuration object to merge and save
+ * Returns true if any provider is configured (local model set, or Gemini key present).
+ * Returns false in 'No AI' mode (provider === 'none').
+ * Does NOT guarantee the provider is currently reachable.
+ */
+export function hasConfiguredProvider() {
+  const config = getConfig();
+  if (config.provider === 'none') return false;
+  return !!(config.apiKeys?.gemini || config.models?.local);
+}
+
+/**
+ * Persists a partial config update, deep-merging with the existing file config.
+ * @param {object} newConfig - Partial configuration to merge and save
  */
 export function saveConfig(newConfig) {
   ensureConfigDir();
-  
-  let currentFileConfig = {};
+
+  let current = {};
   if (fs.existsSync(CONFIG_FILE)) {
     try {
-      currentFileConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+      current = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
     } catch { /* ignore */ }
   }
 
-  const merged = { ...currentFileConfig, ...newConfig };
-  
-  // Need to merge apiKeys properly
+  const merged = { ...current, ...newConfig };
+
+  // Deep merge nested objects
   if (newConfig.apiKeys) {
-    merged.apiKeys = { ...currentFileConfig.apiKeys, ...newConfig.apiKeys };
+    merged.apiKeys = { ...current.apiKeys, ...newConfig.apiKeys };
+  }
+  if (newConfig.models) {
+    merged.models = { ...current.models, ...newConfig.models };
   }
 
   const tempPath = CONFIG_FILE + '.tmp';

@@ -1,31 +1,43 @@
 // Chat — Stateful interactive REPL with execute/dry-run/auto modes.
-// HARDENED: history size cap, improved context resolution, /save and /undo support, graceful error handling.
+// FIXED: actual command stdout/stderr is now injected into AI context after each execution.
 import chalk from 'chalk';
 import readline from 'readline';
 import { runPipeline, saveLastPlan } from '../planner/index.js';
+import { executeCommand } from '../executor/index.js';
+import { recordExecution } from '../context/command-history.js';
 
-const MAX_HISTORY_SIZE = 30;  // Cap conversation context to avoid token overflow
+const MAX_HISTORY_SIZE = 20; // Conversation turns (user + assistant pairs)
+const MAX_OUTPUT_CHARS = 3000; // Cap stdout injected into context to avoid token overflow
+
+// ─── Shell Command Detection ──────────────────────────────
+// Detect if input looks like a direct shell command vs natural language.
+// Direct commands are executed immediately without AI planning.
+const SHELL_PREFIXES = [
+  /^(git|npm|npx|node|python|pip|docker|cargo|go|make|curl|wget)\b/i,
+  /^(ls|dir|cat|echo|mkdir|rmdir|pwd|cp|mv|rm|touch|chmod|chown|type)\b/i,
+  /^(Get-|Set-|Remove-|Test-|New-|Start-|Stop-|Invoke-|Select-|Where-|ForEach-|Write-|Out-|Import-|Export-)/i,
+  /^(grep|find|awk|sed|sort|head|tail|wc|diff|tar|zip|unzip|ssh|scp)\b/i,
+  /^(dotnet|java|javac|mvn|gradle|ruby|gem|php|composer)\b/i,
+];
+
+function looksLikeShellCommand(input) {
+  return SHELL_PREFIXES.some(p => p.test(input));
+}
 
 const BANNER = `
 ${chalk.bold.cyan('╔══════════════════════════════════════════════╗')}
-${chalk.bold.cyan('║')}   ${chalk.bold.white('🧠 AI CLI — Interactive Chat Mode')}          ${chalk.bold.cyan('║')}
+${chalk.bold.cyan('║')}   ${chalk.bold.white('AI CLI — Interactive Chat Mode')}            ${chalk.bold.cyan('║')}
 ${chalk.bold.cyan('╚══════════════════════════════════════════════╝')}
 
 ${chalk.dim('Commands:')}
 ${chalk.dim('  Type any instruction in natural language')}
 ${chalk.dim('  /mode <execute|dry-run|auto>  Change execution mode')}
 ${chalk.dim('  /history                      Show conversation history')}
-${chalk.dim('  /save <name>                  Save last plan with an alias')}
+${chalk.dim('  /save <name>                  Save last plan as a workflow')}
 ${chalk.dim('  /clear                        Clear conversation context')}
 ${chalk.dim('  /exit or /quit                Exit chat')}
 `;
 
-/**
- * Start the interactive chat REPL.
- * @param {object} options
- * @param {boolean} options.dryRun
- * @param {boolean} options.autoExecute
- */
 export async function startChat(options = {}) {
   let { dryRun = false, autoExecute = false } = options;
 
@@ -39,15 +51,14 @@ export async function startChat(options = {}) {
 
   console.log(chalk.dim(`Current mode: ${chalk.bold(currentMode())}\n`));
 
-  const { hasAnyApiKey } = await import('../config/index.js');
-  if (!hasAnyApiKey()) {
-    console.log(chalk.yellow('⚠ AI features disabled. Using basic mode. Add an API key (`GEMINI_API_KEY` or `OPENROUTER_API_KEY`) for full capabilities.'));
-    console.log(chalk.dim('You can still use basic commands here like /save, /history, but natural language instructions will not generate commands.\n'));
+  // Provider check: warn the user if no provider is configured at all.
+  const { hasConfiguredProvider } = await import('../config/index.js');
+  if (!hasConfiguredProvider()) {
+    console.log(chalk.yellow('\u26a0 No AI provider configured. Run `ai init` to set up Ollama or Gemini.'));
+    console.log(chalk.dim('  You can still use /save and /history.\n'));
   }
 
-  // Conversation history for context
   const history = [];
-  // Track last plan result for /save
   let lastResult = null;
 
   const rl = readline.createInterface({
@@ -58,7 +69,10 @@ export async function startChat(options = {}) {
 
   rl.prompt();
 
+  let processing = false;
+
   rl.on('line', async (line) => {
+    if (processing) return;
     const input = line.trim();
 
     if (!input) {
@@ -66,10 +80,10 @@ export async function startChat(options = {}) {
       return;
     }
 
-    // ─── Meta Commands ─────────────────────────────────────
+    // ─── Meta Commands ──────────────────────────────────────
 
     if (input === '/exit' || input === '/quit') {
-      console.log(chalk.cyan('\n👋 Goodbye!\n'));
+      console.log(chalk.cyan('\nGoodbye!\n'));
       rl.close();
       return;
     }
@@ -86,15 +100,15 @@ export async function startChat(options = {}) {
       if (history.length === 0) {
         console.log(chalk.dim('\nNo conversation history yet.\n'));
       } else {
-        console.log(chalk.bold.cyan('\n📜 Conversation History:\n'));
+        console.log(chalk.bold.cyan('\nConversation History:\n'));
         for (const msg of history) {
           const prefix = msg.role === 'user'
             ? chalk.green('  You: ')
             : chalk.blue('  AI:  ');
-          const content = msg.content.length > 120
-            ? msg.content.substring(0, 120) + '...'
+          const snippet = msg.content.length > 150
+            ? msg.content.substring(0, 150) + '...'
             : msg.content;
-          console.log(prefix + chalk.white(content));
+          console.log(prefix + chalk.white(snippet));
         }
         console.log();
       }
@@ -103,21 +117,17 @@ export async function startChat(options = {}) {
     }
 
     if (input.startsWith('/save')) {
-      const parts = input.split(/\s+/);
-      const name = parts[1];
-
+      const name = input.split(/\s+/)[1];
       if (!name) {
         console.log(chalk.yellow('\nUsage: /save <name>\n'));
         rl.prompt();
         return;
       }
-
       if (!lastResult?.plan) {
         console.log(chalk.yellow('\nNo plan to save. Run a command first.\n'));
         rl.prompt();
         return;
       }
-
       try {
         await saveLastPlan(name, { scope: 'local' });
       } catch (err) {
@@ -128,25 +138,16 @@ export async function startChat(options = {}) {
     }
 
     if (input.startsWith('/mode')) {
-      const parts = input.split(/\s+/);
-      const newMode = parts[1];
-
-      if (newMode === 'execute') {
-        dryRun = false;
-        autoExecute = false;
-      } else if (newMode === 'dry-run') {
-        dryRun = true;
-        autoExecute = false;
-      } else if (newMode === 'auto') {
-        dryRun = false;
-        autoExecute = true;
-      } else {
+      const newMode = input.split(/\s+/)[1];
+      if (newMode === 'execute') { dryRun = false; autoExecute = false; }
+      else if (newMode === 'dry-run') { dryRun = true; autoExecute = false; }
+      else if (newMode === 'auto') { dryRun = false; autoExecute = true; }
+      else {
         console.log(chalk.yellow('\nUsage: /mode <execute|dry-run|auto>\n'));
         rl.prompt();
         return;
       }
-
-      console.log(chalk.green(`\n✓ Mode changed to: ${chalk.bold(currentMode())}\n`));
+      console.log(chalk.green(`\n✓ Mode: ${chalk.bold(currentMode())}\n`));
       rl.prompt();
       return;
     }
@@ -158,53 +159,88 @@ export async function startChat(options = {}) {
       return;
     }
 
-    // ─── Natural Language Processing ────────────────────────
+    // ─── Command Processing ───────────────────────────────────
 
-    // Add user message to history
     history.push({ role: 'user', content: input });
 
     try {
-      const result = await runPipeline(input, {
-        history: history.slice(-MAX_HISTORY_SIZE),  // Cap history to prevent token overflow
-        dryRun,
-        autoExecute,
-      });
+      processing = true;
+      rl.pause(); // Suspend interface
 
-      lastResult = result;
+      // ─── Direct Shell Commands ─────────────────────────────
+      // If input looks like a shell command (git, npm, etc.), execute directly
+      // without AI planning or confirmation — just like a regular terminal.
+      if (looksLikeShellCommand(input)) {
+        const result = await executeCommand(input);
+        const step = { command: input, description: input };
+        recordExecution({
+          cwd: process.cwd(),
+          instruction: input,
+          steps: [step],
+          results: [{ step: 1, command: input, ...result }],
+        });
 
-      // Add AI response summary to history for context
-      if (result.plan) {
-        const steps = result.plan.steps || (result.plan.commands || []).map(c => ({ command: c }));
-        const stepSummary = steps.length > 0
-          ? steps.map(s => s.command).join('; ')
-          : '(no commands)';
-        const status = result.success
-          ? 'Executed successfully.'
-          : result.results
-            ? 'Execution failed/partial.'
-            : 'Not executed.';
+        lastResult = {
+          success: result.success,
+          results: [{ step: 1, command: input, ...result }],
+          plan: { intent: input, steps: [step] },
+        };
 
-        const summary = `Intent: ${result.plan.intent}. Steps: ${stepSummary}. ${status}`;
-        history.push({ role: 'assistant', content: summary });
+        let contextBlock = `Executed: ${input}\nStatus: ${result.success ? 'success' : 'failed'}`;
+        if (result.stdout) contextBlock += `\n\nOutput:\n${result.stdout.substring(0, MAX_OUTPUT_CHARS)}`;
+        if (result.stderr) contextBlock += `\n\nStderr:\n${result.stderr.substring(0, 800)}`;
+        history.push({ role: 'assistant', content: contextBlock });
+
+      } else {
+        // ─── AI Pipeline ───────────────────────────────────────
+        const result = await runPipeline(input, {
+          history: history.slice(-MAX_HISTORY_SIZE),
+          dryRun,
+          autoExecute,
+        });
+
+        lastResult = result;
+
+        // Inject real stdout/stderr into AI context for follow-up awareness
+        if (result.plan) {
+          const steps = result.plan.steps || [];
+          const executedCommands = steps.map(s => s.command).join(' && ') || '(no commands)';
+          const execResults = result.results || [];
+
+          const allStdout = execResults
+            .map(r => r.stdout || '')
+            .filter(Boolean)
+            .join('\n')
+            .substring(0, MAX_OUTPUT_CHARS);
+
+          const allStderr = execResults
+            .map(r => r.stderr || '')
+            .filter(Boolean)
+            .join('\n')
+            .substring(0, 800);
+
+          const status = result.success ? 'success' : 'failed';
+
+          let contextBlock = `Executed: ${executedCommands}\nStatus: ${status}`;
+          if (allStdout) contextBlock += `\n\nOutput:\n${allStdout}`;
+          if (allStderr) contextBlock += `\n\nStderr:\n${allStderr}`;
+
+          history.push({ role: 'assistant', content: contextBlock });
+        }
       }
     } catch (error) {
       console.error(chalk.red(`\n✗ Error: ${error.message}\n`));
-      // Still add to history so context is preserved
-      history.push({ role: 'assistant', content: `Error occurred: ${error.message}` });
+      history.push({ role: 'assistant', content: `Error: ${error.message}` });
+    } finally {
+      processing = false;
+      rl.resume();
+      rl.prompt();
     }
-
-    // Trim history if too long
-    while (history.length > MAX_HISTORY_SIZE * 2) {
-      history.shift();
-    }
-
-    rl.prompt();
   });
 
   rl.on('close', () => {
     process.exit(0);
   });
 
-  // Keep the process running
   return new Promise(() => {});
 }

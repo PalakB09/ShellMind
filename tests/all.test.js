@@ -1,0 +1,12 @@
+import './unit/output-parser.test.js';
+import './unit/local-intent.test.js';
+import './unit/format.test.js';
+import './unit/executor.test.js';
+import './unit/parser.test.js';
+import './unit/router.test.js';
+import './unit/sanitizer-validator.test.js';
+import './integration/context-history.test.js';
+import './integration/deterministic-failure.test.js';
+import './integration/pipeline.test.js';
+import './integration/real-world.test.js';
+import './golden/commands.test.js';

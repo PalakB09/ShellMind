@@ -210,7 +210,7 @@ export function displayPlan(steps, safetyAnalysis) {
  */
 export function promptConfirmation(message, isDangerous = false) {
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
 
     const options = isDangerous
       ? `${chalk.red.bold('Dangerous command')} — type "yes" to confirm: `
